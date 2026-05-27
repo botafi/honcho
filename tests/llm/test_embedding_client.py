@@ -1,15 +1,17 @@
+import base64
+import struct
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from src.config import EmbeddingModelConfig
+from src.config import EmbeddingModelConfig, resolve_embedding_model_config
 from src.embedding_client import _EmbeddingClient  # pyright: ignore[reportPrivateUsage]
 
 
 class FakeOpenAIEmbeddingsAPI:
-    def __init__(self, embedding: list[float]) -> None:
-        self.embedding: list[float] = embedding
+    def __init__(self, embedding: list[float] | str) -> None:
+        self.embedding: list[float] | str = embedding
         self.calls: list[dict[str, Any]] = []
 
     async def create(
@@ -60,7 +62,11 @@ async def test_openai_embedding_client_uses_configured_model_and_dimensions(
 
     assert embedding == [0.1] * 8
     assert fake_embeddings.calls == [
-        {"model": "text-embedding-3-small", "input": ["hello world"]}
+        {
+            "model": "text-embedding-3-small",
+            "input": ["hello world"],
+            "encoding_format": "base64",
+        }
     ]
 
 
@@ -153,10 +159,11 @@ async def test_gemini_embedding_client_uses_output_dimensionality(
 def _build_openai_client(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    embedding: list[float],
+    embedding: list[float] | str,
     model: str,
     send_dimensions: bool,
     vector_dimensions: int,
+    encoding_format: str | None = "base64",
 ) -> tuple[_EmbeddingClient, FakeOpenAIEmbeddingsAPI]:
     fake_embeddings = FakeOpenAIEmbeddingsAPI(embedding)
 
@@ -173,6 +180,7 @@ def _build_openai_client(
             transport="openai",
             model=model,
             api_key="test-key",
+            encoding_format=encoding_format,  # pyright: ignore[reportArgumentType]
         ),
         vector_dimensions=vector_dimensions,
         max_input_tokens=8192,
@@ -201,6 +209,7 @@ async def test_openai_embed_forwards_dimensions_when_send_dimensions_true(
             "model": "text-embedding-3-small",
             "input": ["hello"],
             "dimensions": 768,
+            "encoding_format": "base64",
         }
     ]
 
@@ -219,7 +228,13 @@ async def test_openai_embed_omits_dimensions_when_send_dimensions_false(
 
     await client.embed("hello")
 
-    assert fake.calls == [{"model": "text-embedding-3-small", "input": ["hello"]}]
+    assert fake.calls == [
+        {
+            "model": "text-embedding-3-small",
+            "input": ["hello"],
+            "encoding_format": "base64",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -238,6 +253,7 @@ async def test_openai_simple_batch_embed_forwards_dimensions(
 
     assert len(fake.calls) == 1
     assert fake.calls[0]["dimensions"] == 768
+    assert fake.calls[0]["encoding_format"] == "base64"
     assert fake.calls[0]["input"] == ["a", "b"]
 
 
@@ -257,6 +273,69 @@ async def test_openai_batch_embed_forwards_dimensions(
 
     assert len(fake.calls) == 1
     assert fake.calls[0]["dimensions"] == 768
+    assert fake.calls[0]["encoding_format"] == "base64"
+
+
+@pytest.mark.asyncio
+async def test_openai_embed_forwards_float_encoding_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, fake = _build_openai_client(
+        monkeypatch,
+        embedding=[0.1] * 1536,
+        model="google/gemini-embedding-2-preview",
+        send_dimensions=True,
+        vector_dimensions=1536,
+        encoding_format="float",
+    )
+
+    embedding = await client.embed("hello")
+
+    assert len(embedding) == 1536
+    assert fake.calls == [
+        {
+            "model": "google/gemini-embedding-2-preview",
+            "input": ["hello"],
+            "dimensions": 1536,
+            "encoding_format": "float",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_embed_omits_empty_encoding_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, fake = _build_openai_client(
+        monkeypatch,
+        embedding=[0.1] * 1536,
+        model="text-embedding-3-small",
+        send_dimensions=False,
+        vector_dimensions=1536,
+        encoding_format=None,
+    )
+
+    await client.embed("hello")
+
+    assert fake.calls == [{"model": "text-embedding-3-small", "input": ["hello"]}]
+
+
+@pytest.mark.asyncio
+async def test_openai_embed_accepts_base64_embeddings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoded = base64.b64encode(struct.pack("<4f", 0.1, 0.2, 0.3, 0.4)).decode("ascii")
+    client, _fake = _build_openai_client(
+        monkeypatch,
+        embedding=encoded,
+        model="text-embedding-3-small",
+        send_dimensions=False,
+        vector_dimensions=4,
+    )
+
+    embedding = await client.embed("hello")
+
+    assert embedding == pytest.approx([0.1, 0.2, 0.3, 0.4])
 
 
 def _build_embedding_settings(
@@ -271,6 +350,10 @@ def _build_embedding_settings(
         "EMBEDDING_MODEL_CONFIG__MODEL",
         "EMBEDDING_MODEL_CONFIG__TRANSPORT",
         "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE",
+        "EMBEDDING_MODEL_CONFIG__ENCODING_FORMAT",
+        "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL",
+        "EMBEDDING_ENCODING_FORMAT",
+        "EMBEDDING_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -339,3 +422,48 @@ def test_resolve_send_dimensions_never_returns_false_regardless(
         monkeypatch,
     )
     assert s.resolve_send_dimensions() is False
+
+
+def test_embedding_encoding_format_defaults_to_base64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _build_embedding_settings({}, monkeypatch)
+    assert s.MODEL_CONFIG.encoding_format == "base64"
+
+
+def test_embedding_encoding_format_env_override_float(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _build_embedding_settings(
+        {"EMBEDDING_MODEL_CONFIG__ENCODING_FORMAT": "float"},
+        monkeypatch,
+    )
+    assert s.MODEL_CONFIG.encoding_format == "float"
+
+
+def test_embedding_encoding_format_empty_env_omits_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _build_embedding_settings(
+        {"EMBEDDING_MODEL_CONFIG__ENCODING_FORMAT": ""},
+        monkeypatch,
+    )
+    assert s.MODEL_CONFIG.encoding_format is None
+
+
+def test_embedding_top_level_encoding_format_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _build_embedding_settings({"EMBEDDING_ENCODING_FORMAT": "float"}, monkeypatch)
+    assert s.MODEL_CONFIG.encoding_format == "float"
+
+
+def test_embedding_top_level_base_url_env_populates_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _build_embedding_settings(
+        {"EMBEDDING_BASE_URL": "https://openrouter.ai/api/v1"},
+        monkeypatch,
+    )
+    resolved = resolve_embedding_model_config(s.MODEL_CONFIG)
+    assert resolved.base_url == "https://openrouter.ai/api/v1"

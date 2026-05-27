@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import logging
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -150,6 +152,7 @@ class _EmbeddingClient:
     ):
         self.transport: str = config.transport
         self.model: str = config.model
+        self.encoding_format: str | None = config.encoding_format
         self.vector_dimensions: int = vector_dimensions
         self.send_dimensions: bool = send_dimensions
 
@@ -197,6 +200,40 @@ class _EmbeddingClient:
             )
         return embedding
 
+    def _decode_embedding(self, embedding: list[float] | str) -> list[float]:
+        if isinstance(embedding, str):
+            raw = base64.b64decode(embedding)
+            if len(raw) % 4 != 0:
+                raise ValueError("Base64 embedding payload is not float32-aligned")
+            return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+        return [float(value) for value in embedding]
+
+    def _validate_embedding(self, embedding: list[float] | str) -> list[float]:
+        return self._validate_embedding_dimensions(self._decode_embedding(embedding))
+
+    def _openai_embedding_kwargs(self, input_value: list[str]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"model": self.model, "input": input_value}
+        if self.send_dimensions:
+            kwargs["dimensions"] = self.vector_dimensions
+        if self.encoding_format:
+            kwargs["encoding_format"] = self.encoding_format
+        return kwargs
+
+    def _openai_response_data(self, response: Any) -> Any:
+        data = getattr(response, "data", None)
+        if data:
+            return data
+
+        error = getattr(response, "error", None)
+        if error is None and isinstance(response, dict):
+            error = response.get("error")
+        if error is not None:
+            logger.error(
+                "Embedding provider returned an error body without data: %s",
+                error,
+            )
+        raise ValueError("No embedding data received")
+
     async def embed(self, query: str) -> list[float]:
         token_count = len(self.encoding.encode(query))
 
@@ -234,11 +271,10 @@ class _EmbeddingClient:
         openai_client = self.client
 
         async def _call_openai() -> list[float]:
-            openai_kwargs: dict[str, Any] = {"model": self.model, "input": [query]}
-            if self.send_dimensions:
-                openai_kwargs["dimensions"] = self.vector_dimensions
+            openai_kwargs = self._openai_embedding_kwargs([query])
             response = await openai_client.embeddings.create(**openai_kwargs)
-            return self._validate_embedding_dimensions(response.data[0].embedding)
+            data = self._openai_response_data(response)
+            return self._validate_embedding(data[0].embedding)
 
         return await _emit_embedding_call(
             provider=self.transport,
@@ -284,17 +320,13 @@ class _EmbeddingClient:
                                     self._validate_embedding_dimensions(emb.values)
                                 )
                 else:  # openai
-                    openai_kwargs: dict[str, Any] = {
-                        "input": batch,
-                        "model": self.model,
-                    }
-                    if self.send_dimensions:
-                        openai_kwargs["dimensions"] = self.vector_dimensions
+                    openai_kwargs = self._openai_embedding_kwargs(batch)
                     response = await self.client.embeddings.create(**openai_kwargs)
+                    data = self._openai_response_data(response)
                     batch_embeddings.extend(
                         [
-                            self._validate_embedding_dimensions(data.embedding)
-                            for data in response.data
+                            self._validate_embedding(embedding_data.embedding)
+                            for embedding_data in data
                         ]
                     )
                 return batch_embeddings
@@ -449,16 +481,14 @@ class _EmbeddingClient:
                                 self._validate_embedding_dimensions(embedding.values)
                             )
             else:  # openai
-                openai_kwargs: dict[str, Any] = {
-                    "model": self.model,
-                    "input": [item.text for item in batch],
-                }
-                if self.send_dimensions:
-                    openai_kwargs["dimensions"] = self.vector_dimensions
+                openai_kwargs = self._openai_embedding_kwargs(
+                    [item.text for item in batch]
+                )
                 response = await self.client.embeddings.create(**openai_kwargs)
-                for item, embedding_data in zip(batch, response.data, strict=True):
+                data = self._openai_response_data(response)
+                for item, embedding_data in zip(batch, data, strict=True):
                     result[item.text_id][item.chunk_index] = (
-                        self._validate_embedding_dimensions(embedding_data.embedding)
+                        self._validate_embedding(embedding_data.embedding)
                     )
             return result
 
@@ -612,6 +642,7 @@ class EmbeddingClient:
             runtime_config.model,
             runtime_config.api_key,
             runtime_config.base_url,
+            runtime_config.encoding_format,
             settings.EMBEDDING.VECTOR_DIMENSIONS,
             settings.EMBEDDING.MAX_INPUT_TOKENS,
             settings.EMBEDDING.MAX_TOKENS_PER_REQUEST,

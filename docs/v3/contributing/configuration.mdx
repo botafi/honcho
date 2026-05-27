@@ -208,15 +208,23 @@ Embeddings use their own nested model config, separate from the main text-genera
 EMBEDDING_VECTOR_DIMENSIONS=1536
 EMBEDDING_MAX_INPUT_TOKENS=8192
 EMBEDDING_MAX_TOKENS_PER_REQUEST=300000
+EMBEDDING_BASE_URL=http://localhost:8000/v1
 
 # Embedding transport/model selection
 EMBEDDING_MODEL_CONFIG__TRANSPORT=openai  # openai, gemini
 EMBEDDING_MODEL_CONFIG__MODEL=text-embedding-3-small
+EMBEDDING_MODEL_CONFIG__ENCODING_FORMAT=base64  # base64, float, or empty to omit
 
 # Optional endpoint overrides
 EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://localhost:8000/v1
 EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY_ENV=EMBEDDING_CUSTOM_API_KEY
 ```
+
+`EMBEDDING_MODEL_CONFIG__ENCODING_FORMAT=float` is useful for OpenAI-compatible
+providers such as OpenRouter's Gemini embeddings, which reject base64 embedding
+payloads. Leave it empty to omit `encoding_format` and use the provider default.
+`EMBEDDING_BASE_URL` is a shorthand for `EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL`;
+the nested value wins if both are set.
 
 Forwarding `dimensions=` to OpenAI-compatible providers is controlled by `EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE`:
 

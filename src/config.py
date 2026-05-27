@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 ModelTransport = Literal["anthropic", "openai", "gemini"]
 EmbeddingTransport = Literal["openai", "gemini"]
 EmbeddingDimensionsMode = Literal["auto", "always", "never"]
+EmbeddingEncodingFormat = Literal["base64", "float"]
 
 # OpenAI-compatible models that reject the `dimensions=` request parameter.
 _EMBEDDING_KNOWN_REJECTING_MODELS: frozenset[str] = frozenset(
@@ -301,6 +302,7 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
     transport: EmbeddingTransport = "openai"
     overrides: ModelOverrideSettings = Field(default_factory=ModelOverrideSettings)
     dimensions_mode: EmbeddingDimensionsMode = "auto"
+    encoding_format: EmbeddingEncodingFormat | None = "base64"
 
     @model_validator(mode="before")
     @classmethod
@@ -321,6 +323,9 @@ class ConfiguredEmbeddingModelSettings(BaseModel):
             if prefix in {"openai", "gemini"}:
                 update["transport"] = prefix
                 update["model"] = bare_model
+        for key, value in list(update.items()):
+            if key.lower() == "encoding_format":
+                update["encoding_format"] = None if value == "" else value
         return update
 
     @model_validator(mode="after")
@@ -337,6 +342,7 @@ class EmbeddingModelConfig(BaseModel):
     transport: EmbeddingTransport = "openai"
     api_key: str | None = None
     base_url: str | None = None
+    encoding_format: EmbeddingEncodingFormat | None = "base64"
 
     @model_validator(mode="before")
     @classmethod
@@ -357,6 +363,9 @@ class EmbeddingModelConfig(BaseModel):
             if prefix in {"openai", "gemini"}:
                 update["transport"] = prefix
                 update["model"] = bare_model
+        for key, value in list(update.items()):
+            if key.lower() == "encoding_format":
+                update["encoding_format"] = None if value == "" else value
         return update
 
     @model_validator(mode="after")
@@ -459,6 +468,7 @@ def resolve_embedding_model_config(
         transport=configured.transport,
         api_key=api_key,
         base_url=configured.overrides.base_url,
+        encoding_format=configured.encoding_format,
     )
 
 
@@ -696,16 +706,58 @@ class EmbeddingSettings(HonchoSettings):
     VECTOR_DIMENSIONS: Annotated[int, Field(default=1536, gt=0)] = 1536
     MAX_INPUT_TOKENS: Annotated[int, Field(default=8192, gt=0)] = 8192
     MAX_TOKENS_PER_REQUEST: Annotated[int, Field(default=300_000, gt=0)] = 300_000
+    BASE_URL: str | None = None
+    ENCODING_FORMAT: EmbeddingEncodingFormat | None = None
 
     @model_validator(mode="before")
     @classmethod
     def _merge_model_config_defaults(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            _fill_defaults_for_nested_field(
-                cast(dict[str, Any], data),
-                "MODEL_CONFIG",
-                cls._MODEL_CONFIG_DEFAULT,
+            settings_data = cast(dict[str, Any], data)
+            raw_model_config = settings_data.get("MODEL_CONFIG") or settings_data.get(
+                "model_config"
             )
+            model_config_has_encoding = (
+                isinstance(raw_model_config, dict)
+                and "encoding_format" in {key.lower() for key in raw_model_config}
+            )
+            if isinstance(raw_model_config, dict):
+                for key, value in list(raw_model_config.items()):
+                    if key.lower() == "encoding_format":
+                        raw_model_config["encoding_format"] = (
+                            None if value == "" else value
+                        )
+            _fill_defaults_for_nested_field(
+                settings_data, "MODEL_CONFIG", cls._MODEL_CONFIG_DEFAULT
+            )
+            encoding_format = settings_data.get(
+                "ENCODING_FORMAT", settings_data.get("encoding_format")
+            )
+            if encoding_format == "":
+                settings_data["ENCODING_FORMAT"] = None
+                encoding_format = None
+            model_config = settings_data.get("MODEL_CONFIG") or settings_data.get(
+                "model_config"
+            )
+            if (
+                encoding_format is not None
+                and isinstance(model_config, dict)
+                and not model_config_has_encoding
+            ):
+                model_config["encoding_format"] = encoding_format
+            base_url = settings_data.get("BASE_URL", settings_data.get("base_url"))
+            if base_url == "":
+                settings_data["BASE_URL"] = None
+                base_url = None
+            if base_url is not None and isinstance(model_config, dict):
+                overrides = model_config.get("overrides") or model_config.get(
+                    "OVERRIDES"
+                )
+                if not isinstance(overrides, dict):
+                    overrides = {}
+                    model_config["overrides"] = overrides
+                if "base_url" not in {key.lower() for key in overrides}:
+                    overrides["base_url"] = base_url
         return data  # pyright: ignore[reportUnknownVariableType]
 
     def resolve_send_dimensions(self) -> bool:

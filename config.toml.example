@@ -70,6 +70,9 @@ MAX_TOKENS_PER_REQUEST = 300000
 [embedding.model_config]
 transport = "openai"
 model = "text-embedding-3-small"
+# Set to "float" for providers such as OpenRouter Gemini embeddings that reject base64.
+# Set to null to omit encoding_format and use the provider default.
+encoding_format = "base64"
 
 # Optional module-level endpoint overrides
 # [embedding.model_config.overrides]
